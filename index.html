@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>BiznesHisob</title>
+<style>
+:root{--bg:#f4f6f8;--card:#fff;--tx:#1a2230;--mu:#667085;--bd:#e0e4ea;--pr:#2563eb;--ok:#16a34a;--er:#dc2626}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1520;--card:#1a2230;--tx:#e8edf5;--mu:#98a2b3;--bd:#2c3748;--pr:#5b8def;--ok:#34d399;--er:#f87171}}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--tx)}
+header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;background:var(--card);border-bottom:1px solid var(--bd)}
+h1{font-size:18px;margin:0}h2{font-size:16px;margin:0 0 10px}
+nav{display:flex;gap:6px;padding:10px 12px;overflow-x:auto}
+nav button{white-space:nowrap}
+nav button.on{background:var(--pr);color:#fff;border-color:var(--pr)}
+main{padding:0 12px 40px;max-width:900px;margin:auto}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px;margin-bottom:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px}
+.grid .card{margin:0}.big{font-size:20px;font-weight:700}.mu{color:var(--mu);font-size:13px}
+.ok{color:var(--ok)}.er{color:var(--er)}
+input,select,button{font:inherit;padding:9px 10px;border:1px solid var(--bd);border-radius:8px;background:var(--card);color:var(--tx)}
+button{cursor:pointer}button.pr{background:var(--pr);color:#fff;border-color:var(--pr)}
+form{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:10px}
+.row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-top:1px solid var(--bd)}
+.row>div:first-child{min-width:0;overflow-wrap:anywhere}
+.bar{height:8px;border-radius:4px;background:var(--pr);margin-top:3px}
+canvas{width:100%;height:220px;display:block}
+#msg{color:var(--er);min-height:20px;font-size:14px}
+#lock{max-width:360px;margin:12vh auto;padding:0 14px}
+#lock form{grid-template-columns:1fr}
+@media print{header,nav,.noprint{display:none!important}}
+</style>
+</head>
+<body>
+<div id="lock">
+  <div class="card">
+    <h1>BiznesHisob</h1>
+    <p class="mu" id="lt"></p>
+    <form id="af" autocomplete="off">
+      <input id="pw" type="password" placeholder="Parol" maxlength="128" required autocomplete="current-password">
+      <input id="pw2" type="password" placeholder="Parolni takrorlang" maxlength="128" autocomplete="new-password" hidden>
+      <button class="pr" type="submit">Kirish</button>
+    </form>
+    <div id="msg" role="alert"></div>
+  </div>
+</div>
+<div id="app" hidden>
+  <header><h1>BiznesHisob</h1><button id="out">Chiqish</button></header>
+  <nav id="nav"></nav>
+  <main id="view"></main>
+</div>
+<script>
+'use strict';
+/* ===== Yordamchi funksiyalar (XSS himoyasi: faqat textContent / append) ===== */
+const $=s=>document.querySelector(s);
+const E=(t,a={},...c)=>{const e=document.createElement(t);for(const k in a){if(k==='class')e.className=a[k];else if(k.startsWith('on'))e.addEventListener(k.slice(2),a[k]);else e.setAttribute(k,a[k]);}c.flat().forEach(x=>e.append(x instanceof Node?x:String(x)));return e;};
+const fmt=n=>Number(n).toLocaleString('ru-RU',{maximumFractionDigits:2})+" so'm";
+const today=()=>{const d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');};
+const uid=()=>crypto.randomUUID();
+
+/* ===== Kriptografiya: PBKDF2 (250 000 iteratsiya) + AES-GCM-256 ===== */
+const enc=new TextEncoder(),dec=new TextDecoder();
+const b64=b=>{let s='';for(const x of new Uint8Array(b))s+=String.fromCharCode(x);return btoa(s);};
+const unb64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+async function deriveKey(pw,salt){
+  const m=await crypto.subtle.importKey('raw',enc.encode(pw),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:250000,hash:'SHA-256'},m,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+let KEY=null,S=null;
+async function save(){
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},KEY,enc.encode(JSON.stringify(S)));
+  localStorage.setItem('bh_data',b64(iv)+'.'+b64(ct));
+}
+async function load(){
+  const [i,c]=localStorage.getItem('bh_data').split('.');
+  const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:unb64(i)},KEY,unb64(c));
+  return JSON.parse(dec.decode(pt));
+}
+
+/* ===== Kirish: parol, bloklash, avtomatik chiqish ===== */
+const msg=t=>{$('#msg').textContent=t;};
+let hasData=false;
+try{hasData=!!localStorage.getItem('bh_data');}catch{msg("Brauzer xotirasi mavjud emas.");}
+$('#lt').textContent=hasData?'Ma\u2019lumotlarni ochish uchun parolni kiriting.':'Yangi parol yarating (kamida 8 belgi). Parolni tiklab bo\u2018lmaydi!';
+if(!hasData){$('#pw2').hidden=false;$('#pw2').required=true;}
+
+$('#af').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const pw=$('#pw').value,now=Date.now(),lock=+localStorage.getItem('bh_lock')||0;
+  if(now<lock){msg('Bloklangan. '+Math.ceil((lock-now)/1000)+' soniyadan keyin urinib ko\u2018ring.');return;}
+  try{
+    if(!hasData){
+      if(pw.length<8||pw!==$('#pw2').value){msg('Parol kamida 8 belgi bo\u2018lsin va ikkala maydon bir xil bo\u2018lsin.');return;}
+      const salt=crypto.getRandomValues(new Uint8Array(16));
+      localStorage.setItem('bh_salt',b64(salt));
+      KEY=await deriveKey(pw,salt);
+      S={tx:[],debts:[],cats:{income:['Sotuv','Xizmat','Boshqa'],expense:['Xom ashyo','Ijara','Maosh','Kommunal','Soliq','Boshqa']}};
+      await save();
+    }else{
+      KEY=await deriveKey(pw,unb64(localStorage.getItem('bh_salt')));
+      try{S=await load();}catch{
+        const n=(+localStorage.getItem('bh_fail')||0)+1;
+        localStorage.setItem('bh_fail',n);
+        if(n>=5)localStorage.setItem('bh_lock',Date.now()+30000*Math.pow(2,Math.min(n-5,8)));
+        KEY=null;$('#pw').value='';msg('Parol noto\u2018g\u2018ri. Urinish: '+n);return;
+      }
+      localStorage.removeItem('bh_fail');
+    }
+    $('#pw').value='';$('#pw2').value='';start();
+  }catch{msg('Xatolik yuz berdi.');}
+});
+
+let idle;
+function resetIdle(){clearTimeout(idle);idle=setTimeout(logout,5*60*1000);}
+function logout(){KEY=null;S=null;location.reload();}
+$('#out').addEventListener('click',logout);
+
+/* ===== Dastur ===== */
+let tab='panel',month=today().slice(0,7);
+const TABS=[['panel','Panel'],['tx','Daromad/Xarajat'],['debt','Qarzdorlik'],['cat','Kategoriya'],['rep','Hisobot']];
+function start(){
+  $('#lock').hidden=true;$('#app').hidden=false;
+  ['click','keydown','touchstart'].forEach(ev=>document.addEventListener(ev,resetIdle,{passive:true}));
+  resetIdle();render();
+}
+async function commit(){await save();render();}
+
+/* Tekshiruv (validatsiya) */
+const okAmount=v=>{const n=Math.round(Number(v)*100)/100;return Number.isFinite(n)&&n>0&&n<1e12?n:null;};
+const okDate=v=>/^\d{4}-\d{2}-\d{2}$/.test(v)&&!isNaN(new Date(v));
+const clean=(v,m)=>String(v).replace(/[\u0000-\u001f]/g,' ').trim().slice(0,m);
+
+const sum=(arr,f)=>arr.filter(f).reduce((a,x)=>a+x.amount,0);
+const inMonth=(m)=>x=>x.date.slice(0,7)===m;
+
+function render(){
+  const nav=$('#nav');nav.replaceChildren(...TABS.map(([k,t])=>E('button',{class:k===tab?'on':'',onclick:()=>{tab=k;render();}},t)));
+  const v=$('#view');v.replaceChildren();
+  ({panel:vPanel,tx:vTx,debt:vDebt,cat:vCat,rep:vRep})[tab](v);
+}
+
+function vPanel(v){
+  const m=today().slice(0,7),mt=S.tx.filter(inMonth(m));
+  const inc=sum(mt,x=>x.type==='income'),exp=sum(mt,x=>x.type==='expense');
+  const rec=sum(S.debts,d=>d.kind==='receivable'&&!d.paid),pay=sum(S.debts,d=>d.kind==='payable'&&!d.paid);
+  v.append(E('div',{class:'grid'},
+    card('Daromad (oy)',fmt(inc),'ok'),card('Xarajat (oy)',fmt(exp),'er'),
+    card('Foyda (oy)',fmt(inc-exp),inc-exp>=0?'ok':'er'),
+    card('Menga qarz',fmt(rec),''),card('Men qarzman',fmt(pay),'')));
+  const cv=E('canvas',{});v.append(E('div',{class:'card'},E('h2',{},'Oxirgi 6 oy'),cv));
+  drawChart(cv);
+}
+const card=(t,val,c)=>E('div',{class:'card'},E('div',{class:'mu'},t),E('div',{class:'big '+c},val));
+
+function drawChart(cv){
+  const months=[];const d=new Date();d.setDate(1);
+  for(let i=5;i>=0;i--){const x=new Date(d.getFullYear(),d.getMonth()-i,1);months.push(x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0'));}
+  const data=months.map(m=>[sum(S.tx,x=>x.type==='income'&&x.date.slice(0,7)===m),sum(S.tx,x=>x.type==='expense'&&x.date.slice(0,7)===m)]);
+  const r=devicePixelRatio||1,W=cv.clientWidth||600,H=220;cv.width=W*r;cv.height=H*r;
+  const g=cv.getContext('2d');g.scale(r,r);
+  const cs=getComputedStyle(document.body),cl=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const max=Math.max(1,...data.flat()),bw=(W-30)/months.length;
+  g.font='12px system-ui';g.fillStyle=cs.color;g.textAlign='center';
+  data.forEach((p,i)=>{
+    const x=15+i*bw,h1=(H-40)*p[0]/max,h2=(H-40)*p[1]/max;
+    g.fillStyle=cl('--ok');g.fillRect(x+bw*.12,H-25-h1,bw*.34,h1);
+    g.fillStyle=cl('--er');g.fillRect(x+bw*.52,H-25-h2,bw*.34,h2);
+    g.fillStyle=cs.color;g.fillText(months[i].slice(2),x+bw/2,H-8);
+  });
+}
+
+function vTx(v){
+  const type=E('select',{},E('option',{value:'income'},'Daromad'),E('option',{value:'expense'},'Xarajat'));
+  const cat=E('select',{});
+  const fill=()=>cat.replaceChildren(...S.cats[type.value].map(c=>E('option',{value:c},c)));
+  type.addEventListener('change',fill);fill();
+  const amt=E('input',{type:'number',step:'0.01',min:'0.01',placeholder:'Summa',required:''});
+  const dt=E('input',{type:'date',value:today(),required:''});
+  const note=E('input',{maxlength:'100',placeholder:'Izoh'});
+  const f=E('form',{onsubmit:async e=>{e.preventDefault();
+    const a=okAmount(amt.value);
+    if(!a||!okDate(dt.value)||!S.cats[type.value].includes(cat.value)){alert("Ma'lumotlar noto'g'ri.");return;}
+    S.tx.push({id:uid(),type:type.value,amount:a,cat:cat.value,date:dt.value,note:clean(note.value,100)});await commit();}},
+    type,amt,cat,dt,note,E('button',{class:'pr',type:'submit'},"Qo'shish"));
+  const list=E('div',{},...[...S.tx].sort((a,b)=>b.date.localeCompare(a.date)).slice(0,50).map(x=>
+    E('div',{class:'row'},E('div',{},E('b',{class:x.type==='income'?'ok':'er'},(x.type==='income'?'+ ':'- ')+fmt(x.amount)),' \u2022 '+x.cat,E('div',{class:'mu'},x.date+(x.note?' \u2022 '+x.note:''))),
+      E('button',{onclick:async()=>{if(confirm("O'chirilsinmi?")){S.tx=S.tx.filter(t=>t.id!==x.id);await commit();}}},'\u2715'))));
+  v.append(E('div',{class:'card'},E('h2',{},'Yangi operatsiya'),f),E('div',{class:'card'},E('h2',{},'Oxirgi 50 ta operatsiya'),list));
+}
+
+function vDebt(v){
+  const kind=E('select',{},E('option',{value:'receivable'},'Menga qarz'),E('option',{value:'payable'},'Men qarzman'));
+  const who=E('input',{maxlength:'60',placeholder:'Kim (ism/firma)',required:''});
+  const amt=E('input',{type:'number',step:'0.01',min:'0.01',placeholder:'Summa',required:''});
+  const due=E('input',{type:'date'});
+  const f=E('form',{onsubmit:async e=>{e.preventDefault();
+    const a=okAmount(amt.value),w=clean(who.value,60);
+    if(!a||!w||(due.value&&!okDate(due.value))){alert("Ma'lumotlar noto'g'ri.");return;}
+    S.debts.push({id:uid(),kind:kind.value,person:w,amount:a,due:due.value,paid:false});await commit();}},
+    kind,who,amt,due,E('button',{class:'pr',type:'submit'},"Qo'shish"));
+  const list=E('div',{},...S.debts.map(d=>{
+    const late=!d.paid&&d.due&&d.due<today();
+    return E('div',{class:'row'},E('div',{},E('b',{},d.person),' \u2022 '+(d.kind==='receivable'?'menga qarz':'men qarzman')+' \u2022 '+fmt(d.amount),
+      E('div',{class:'mu '+(late?'er':'')},(d.paid?"To'langan":'To\u2018lanmagan')+(d.due?' \u2022 muddat: '+d.due+(late?' (kechikkan)':''):''))),
+      E('div',{},E('button',{onclick:async()=>{d.paid=!d.paid;await commit();}},d.paid?'Qaytarish':"To'landi"),' ',
+      E('button',{onclick:async()=>{if(confirm("O'chirilsinmi?")){S.debts=S.debts.filter(x=>x.id!==d.id);await commit();}}},'\u2715')));}));
+  v.append(E('div',{class:'card'},E('h2',{},'Yangi qarz'),f),E('div',{class:'card'},E('h2',{},"Qarzlar ro'yxati"),list));
+}
+
+function vCat(v){
+  [['income','Daromad kategoriyalari'],['expense','Xarajat kategoriyalari']].forEach(([k,t])=>{
+    const inp=E('input',{maxlength:'40',placeholder:'Yangi kategoriya',required:''});
+    const f=E('form',{onsubmit:async e=>{e.preventDefault();const c=clean(inp.value,40);
+      if(!c||S.cats[k].includes(c)||S.cats[k].length>=50)return;S.cats[k].push(c);await commit();}},inp,E('button',{class:'pr',type:'submit'},"Qo'shish"));
+    v.append(E('div',{class:'card'},E('h2',{},t),f,...S.cats[k].map(c=>E('div',{class:'row'},E('div',{},c),
+      E('button',{onclick:async()=>{if(S.cats[k].length>1&&confirm("O'chirilsinmi?")){S.cats[k]=S.cats[k].filter(x=>x!==c);await commit();}}},'\u2715')))));
+  });
+}
+
+function vRep(v){
+  const mi=E('input',{type:'month',value:month,onchange:e=>{if(/^\d{4}-\d{2}$/.test(e.target.value)){month=e.target.value;render();}}});
+  const mt=S.tx.filter(inMonth(month));
+  const inc=sum(mt,x=>x.type==='income'),exp=sum(mt,x=>x.type==='expense');
+  const brk=type=>{const tot=type==='income'?inc:exp,map={};
+    mt.filter(x=>x.type===type).forEach(x=>map[x.cat]=(map[x.cat]||0)+x.amount);
+    return Object.entries(map).sort((a,b)=>b[1]-a[1]).map(([c,a])=>E('div',{style:'margin:8px 0'},c+': '+fmt(a)+' ('+Math.round(a/tot*100)+'%)',
+      E('div',{class:'bar',style:'width:'+Math.max(2,Math.round(a/tot*100))+'%;background:var(--'+(type==='income'?'ok':'er')+')'})));};
+  v.append(E('div',{class:'card noprint'},E('h2',{},'Hisobot davri'),mi,' ',
+    E('button',{onclick:()=>exportCsv(mt)},'CSV yuklash'),' ',E('button',{onclick:()=>window.print()},'Chop etish')),
+    E('div',{class:'grid'},card('Daromad',fmt(inc),'ok'),card('Xarajat',fmt(exp),'er'),card('Sof foyda',fmt(inc-exp),inc-exp>=0?'ok':'er')),
+    E('div',{class:'card'},E('h2',{},'Daromad kategoriyalari bo\u2018yicha'),...brk('income')),
+    E('div',{class:'card'},E('h2',{},'Xarajat kategoriyalari bo\u2018yicha'),...brk('expense')));
+}
+
+/* CSV: formula (CSV injection) hujumidan himoya */
+function exportCsv(rows){
+  const q=x=>{let s=String(x);if(/^[=+\-@\t\r]/.test(s))s="'"+s;return '"'+s.replace(/"/g,'""')+'"';};
+  const csv='\ufeff'+[['Sana','Tur','Kategoriya','Summa','Izoh'],...rows.map(x=>[x.date,x.type==='income'?'Daromad':'Xarajat',x.cat,x.amount,x.note])].map(r=>r.map(q).join(',')).join('\r\n');
+  const u=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
+  const a=E('a',{href:u,download:'hisobot-'+month+'.csv'});document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),1000);
+}
+</script>
+</body>
+</html>
